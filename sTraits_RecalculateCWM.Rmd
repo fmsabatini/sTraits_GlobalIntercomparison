@@ -1,0 +1,627 @@
+---
+title: "sTraits - Recalculate CWMs"
+author: "Francesco Maria Sabatini"
+date: "07/10/2022"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    theme: united
+---
+
+<center>
+  ![](https://www.idiv.de/fileadmin/content/Files_sDiv/sDiv_Workshops_Photos_Docs/sDiv_WS_Documents_sPlot/splot-long-rgb.png "sPlot Logo")
+</center>
+  
+    
+      
+        
+**Timestamp:** `r date()`  
+**Drafted:** Francesco Maria Sabatini  
+**Revised:**  
+**Version:** 2.1  
+**Changes of version 2.0:** CWM calculated both for the whole vegetation plot, and for each growth form separately (=layer). For those plots for which we have no EUNIS classification, I added a classification of forest plots into broad forest types based on the leaf phenology and leaf type of tree species received from Jens Kattge (TRY5_GrowthForm_LeafType_Phenology_2022_09_19.xlsx).  
+**Changes of version 2.1:** Script rerun on sPlotOpen v1.2  
+
+
+This notebook calculates CWMs for plots in sPlotOpen, separately for vegetation layers, as required by Benjamin Dechant. It also includes a classification of forest plots into broad forest types, i.e.,:  
+
+- ENF:  evergreen needleleaf forest  
+- DNF: deciduous needleleaf forest  
+- EBF:  evergreen broadleaf forest  
+- DBF: deciduous broadleaf forest  
+- MF:  mixed forest (i.e. the rest)  
+
+Each plot is assigned to the main vegetation type based on the dominant growth form. For the dominant growth form the cumulative relative cover is also given, so that different thresholds can be used for filtering 'pure' vegetation types against mixed vegetation types.  
+
+
+# Workspace preparation
+Load Packages
+```{r results="hide", message=F, warning=F}
+library(tidyverse)
+library(kableExtra)
+library(openxlsx)
+#save temporary files
+write("TMPDIR = /data/sPlot/users/Francesco/_tmp", file=file.path(Sys.getenv('TMPDIR'), '.Renviron'))
+write("R_USER = /data/sPlot/users/Francesco/_tmp", file=file.path(Sys.getenv('R_USER'), '.Renviron'))
+#rasterOptions(tmpdir="/data/sPlot/users/Francesco/_tmp")
+```
+Ancillary functions
+```{r}
+# Ancillary function to calculate CWV
+variance2.fun <- function(trait, abu){
+  res <- as.double(NA)
+  #nam <- nam[!is.na(trait)]
+  abu <- abu[!is.na(trait)]
+  trait <- trait[!is.na(trait)]
+  abu <- abu/sum(abu)
+  if (length(trait)>1){
+    # you need more than 1 observation to calculate
+    # skewness and kurtosis
+    # for calculation see 
+    # http://r.789695.n4.nabble.com/Weighted-skewness-and-curtosis-td4709956.html
+    m.trait <- weighted.mean(trait,abu)
+    res <- sum(abu*(trait-m.trait)^2)
+  }
+  res
+}
+```
+
+# Import and clean data
+Load sPlotOpen
+```{r}
+load("~/share/groups/sPlot/releases/_sPlotOpenDB/sPlotOpen.RData")
+```
+Import cross-link table between EUNIS classification and the five forest types based on leaf phenology listed above
+```{r}
+crosslink <- openxlsx::read.xlsx("_AncillaryData/Eunis_ForestTypes_Phenology.xlsx") %>%
+  dplyr::rename(FT=4)
+
+```
+
+```{r, echo=F}
+knitr::kable(crosslink,
+             caption="Cross link table between EUNIS codes and Forest Types") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                  full_width = F, position = "center")
+```
+Attach to header data
+```{r}
+header.oa <- header.oa %>% 
+  left_join(crosslink %>% 
+              dplyr::select(ESY=EUNIS_code, FT), by="ESY") %>% 
+  #manual correction to some unclassified forests
+  mutate(FT=replace(FT, list=str_detect(ESY, "^G33|^G34|^G36"), values = "ENF")) %>% 
+  mutate(FT=replace(FT, list=str_detect(ESY, "^G32"), values = "MF"))  %>% 
+  mutate(FT=replace(FT, list=str_detect(ESY, "^G19"), values = "DBF"))  
+  
+
+# Number of plots with Forest Type info from sPlotOpen (ESY)
+header.oa %>% 
+  filter(!is.na(FT)) %>% 
+  nrow()
+```
+
+Load species level gap-filled trait data
+```{r}
+load("~/share/groups/sPlot/releases/sPlot2.0/TRY.all.mean.sd.3.by.genus.species.Rdata")
+TRY <- TRY.all.mean.sd.3.by.genus.species
+rm(TRY.all.mean.sd.3.by.genus.species)
+```
+Load additional info for defining tree & shrub species
+```{r}
+# Import growth form info from sPlot 3.0
+load("~/share/groups/sPlot/releases/sPlot3.0/Traits_CWMs_sPlot3.RData")
+growth_forms <- sPlot.traits %>% 
+  dplyr::select(Species:is.tree.or.tall.shrub)
+rm(CWM, try.combined.means, sPlot.traits)
+```
+
+```{r}
+# Import growth form info from TRY 5.0
+gf.try5.input <- read.xlsx("_AncillaryData/TRY5_GrowthForm_LeafType_Phenology_2022_09_19.xlsx", 
+                           sheet=1) %>% 
+  as_tibble() %>% 
+  distinct(AccSpeciesName, .keep_all = T)
+
+table(gf.try5.input$primary.growth.form)
+
+
+# simplify composite growth forms
+gf.try5 <- gf.try5.input %>% 
+  dplyr::select(AccSpeciesName, primary.growth.form:Leaf.type) %>%
+  #match with sPlotOpen by species names
+  filter(AccSpeciesName %in% unique(c(DT2.oa$Species, DT2.oa$Original_species))) %>% 
+  dplyr::rename(GrowthForm0=primary.growth.form, Species=AccSpeciesName) %>% 
+  mutate(GrowthForm_simplified=GrowthForm0) %>% 
+  #priority is being given to herbs (as in the construction of sPlot 3.0)
+  # i.e., in case of a herb/shrub species, it'll be considered as herb
+  mutate(GrowthForm_simplified=replace(GrowthForm_simplified, 
+                                       list=str_detect(GrowthForm0, "tree"), "tree")) %>% 
+  mutate(GrowthForm_simplified=replace(GrowthForm_simplified, 
+                                       list=str_detect(GrowthForm0, "shrub|subshrub"), "shrub")) %>% 
+  mutate(GrowthForm_simplified=replace(GrowthForm_simplified, 
+                                       list=str_detect(GrowthForm0, "herb"), "herb"))
+
+## Simplify leaf phenology and leaf type info
+gf.try5 <- gf.try5 %>% 
+  mutate(LeafPhenology_simplified=as.factor(Leaf.phenology.type)) %>% 
+  mutate(LeafPhenology_simplified=fct_collapse(LeafPhenology_simplified, 
+                                               deciduous = c("deciduous", "semi-deciduous"), 
+                                               evergreen = c("deciduous/evergreen", "semi-evergreen"))) %>% mutate(LeafType_simplified=as.factor(Leaf.type)) %>% 
+  mutate(LeafType_simplified=fct_collapse(LeafType_simplified, 
+                                          broadleaved=c("broadleaved, needle like", 
+                                                        "broadleaved/needle leaved", 
+                                                        "broadleaved/spines",
+                                                        "broadleaved/needle leaved/scale-shaped", 
+## I CHOSE TO classify plants with scale-shaped leaves (e.g., Tamarix, Orobanche, Ephedra) as broadleaved
+                                                         "scale-shaped",   
+                                                         "scale-shaped/leafless", 
+                                                         "microphyll", "other"), 
+                                          needleleaved=c("needle leaved", 
+                                                         "needle leaved/scale-shaped"))) 
+
+## Summarize the number of species having leaf type and phenology info for each combination
+gf.try5 %>% 
+  count(LeafType_simplified, LeafPhenology_simplified)
+#For two-thirds of the species there's no phenology info
+```
+## Create Species lists for each growth form
+Create lists of trees
+```{r}
+## tree list based on sPlot 3.0
+tree_list1 <- (growth_forms %>% 
+                         filter(GrowthForm == "tree") %>% 
+                         pull(Species))
+
+## tree list based on try5
+tree_list2 <- gf.try5 %>% 
+  filter(GrowthForm_simplified == "tree") %>% 
+  pull(Species)
+
+# List of tree species based on Keppel et al. 2021 JVS
+# Not sure it corresponds to the published version though.
+load("~/share/groups/sPlot/users/Francesco/Misc/Keppel_Weigelt_Trees/BGCI_gift_trees_sPlotR1.RData")
+tree_list3 <- trees_sPlot
+
+tree_list <- unique(c(tree_list1, tree_list2, tree_list3))
+```
+These three lists contain a total of `r length(tree_list)` species of trees. Of these `r sum(unique(DT2.oa$Species) %in% tree_list)` species are contained in sPlotOpen.  
+\newline
+Create list of shrubs
+```{r}
+# shrub list based on sPlot 3.0
+shrub_list1 <- (growth_forms %>% 
+                         filter(GrowthForm == "shrub") %>% 
+                         pull(Species))
+
+# shrub list based on try5
+shrub_list2 <- gf.try5 %>% 
+  filter(GrowthForm_simplified == "shrub") %>% 
+  pull(Species)
+shrub_list <- unique(c(shrub_list1, shrub_list2))
+```
+These two lists contain a total of `r sum(unique(DT2.oa$Species) %in% shrub_list)` shrub species among those contained in sPlotOpen.  
+
+Create list of herbs 
+```{r}
+# herb list based on sPlot 3.0
+herb_list1 <- (growth_forms %>% 
+                         filter(GrowthForm == "herb") %>% 
+                         pull(Species))
+
+# herb list based on try5
+herb_list2 <- gf.try5 %>% 
+  filter(GrowthForm_simplified == "herb") %>% 
+  pull(Species)
+herb_list <- unique(c(herb_list1, herb_list2))
+```
+These two lists contain a total of `r sum(unique(DT2.oa$Species) %in% herb_list)` herb species among those contained in sPlotOpen.  
+
+
+## Attach gf and phenology information to DT2.oa 
+```{r}
+DT2.oa.gf <- DT2.oa %>% 
+  mutate(gf="unknown") %>% 
+  mutate(gf=replace(gf, Species %in% tree_list, "tree")) %>% 
+  mutate(gf=replace(gf, Original_species %in% tree_list, "tree")) %>% 
+  mutate(gf=replace(gf, Species %in% shrub_list, "shrub")) %>% 
+  mutate(gf=replace(gf, Original_species %in% shrub_list, "shrub")) %>% 
+  mutate(gf=replace(gf, Species %in% herb_list, "herb")) %>% 
+  mutate(gf=replace(gf, Original_species %in% herb_list, "herb")) %>%
+  left_join(gf.try5 %>% 
+              dplyr::select(Species, LeafType_simplified, LeafPhenology_simplified), 
+            by="Species")
+
+#Check number of species with missing gf info
+DT2.oa.gf %>% 
+  distinct(Species, .keep_all = T) %>% 
+  count(gf)
+
+#check number of species with missing leaf type info
+DT2.oa.gf %>% 
+  distinct(Species, .keep_all = T) %>% 
+  count(LeafType_simplified)
+
+#check number of species with missing leaf phenology info
+DT2.oa.gf %>% 
+  distinct(Species, .keep_all = T) %>% 
+  count(LeafPhenology_simplified)
+
+#check number of individual species with missing gf and leaf info
+DT2.oa.gf %>% 
+  distinct(Species, .keep_all = T) %>% 
+  count(gf, LeafType_simplified, LeafPhenology_simplified) %>% 
+  print(n=40)
+
+#Check number of entries with missing values in gf and leaf info
+# since not all species appear with the same frequency in sPlotOpen
+DT2.oa.gf %>% 
+  count(gf, LeafType_simplified, LeafPhenology_simplified) %>% 
+  print(n=40)
+
+```
+
+
+
+
+Calculate plot level proportion of the relative cover in each growth form and use it to classify plots to Forest or Shrubland vegetation types.
+```{r}
+PlotLevel_gfCovers <- DT2.oa.gf %>% 
+  group_by(PlotObservationID, gf) %>% 
+  summarize(Cumulative_cover = sum(Relative_cover)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = gf, values_from = Cumulative_cover, values_fill = 0) %>% 
+  ##tentative classification in vegetation types
+  mutate(vegtype=NA) %>% 
+  mutate(vegtype=ifelse( (unknown<.70 & tree>.10), "Forest", vegtype)) %>% 
+  mutate(vegtype=ifelse(  (is.na(vegtype) & unknown<.70 & shrub>.10), "Shrubland", vegtype)) %>% 
+  mutate(vegtype=ifelse(  (is.na(vegtype) & unknown<.70 & shrub<.10 & tree<.10), "Other", vegtype)) %>% 
+  mutate(gf_coverage=1-unknown) %>% 
+  relocate(gf_coverage, .before=herb) %>% 
+  dplyr::select(-unknown) %>% 
+  pivot_longer(herb:tree, names_to="Layer", values_to="Layer_cover") %>% 
+  relocate(vegtype, .after=last_col())
+PlotLevel_gfCovers %>% distinct(PlotObservationID, vegtype) %>% count(vegtype)
+
+# If a forest is already classified as forest or shrubland in sPlotOpen, impose that vegtype
+PlotLevel_gfCovers <- PlotLevel_gfCovers %>% 
+  left_join(header.oa %>% 
+              dplyr::select(PlotObservationID, Forest:Sparse_vegetation, is_forest)) %>% 
+  mutate(vegtype=replace(vegtype, list= (Shrubland == 1), "Shrubland")) %>% 
+  mutate(vegtype=replace(vegtype, list= (Forest == 1 | (!is.na(is_forest) & is_forest==1)), "Forest")) %>% 
+  dplyr::select(PlotObservationID:vegtype)
+
+PlotLevel_gfCovers %>% distinct(PlotObservationID, vegtype) %>% count(vegtype)
+
+# Show random selection of plots
+PlotLevel_gfCovers %>% 
+  filter(PlotObservationID %in% sample(header.oa$PlotObservationID, 5, replace=F)) %>% 
+  print(n=15)
+```
+Attempt classification of forest plots in forest types based on leaf type and leaf phenology info
+
+```{r}
+PlotLevel_leaf_Cover <- left_join(
+# Calculate cumulative cover of tree species across leaf type classes
+                              DT2.oa.gf %>% 
+                                    filter(gf=="tree") %>% 
+                                    mutate(LeafType_simplified=fct_explicit_na(
+                                      LeafType_simplified, "LT_unknown")) %>% 
+                                    group_by(PlotObservationID, LeafType_simplified) %>% 
+                                    summarize(Cumulative_cover_LT = sum(Relative_cover)) %>% 
+                                    ungroup() %>% 
+                                    pivot_wider(names_from = LeafType_simplified, 
+                                                values_from = Cumulative_cover_LT, 
+                                                values_fill = 0), 
+# Calculate cumulative cover of tree species across leaf phenology classes
+                                  DT2.oa.gf %>% 
+                                    filter(gf=="tree") %>%
+                                    mutate(LeafPhenology_simplified = fct_explicit_na( 
+                                      LeafPhenology_simplified, "LP_unknown")) %>%
+                                    group_by(PlotObservationID, LeafPhenology_simplified) %>% 
+                                    summarize(Cumulative_cover_LP = sum(Relative_cover)) %>% 
+                                    ungroup() %>% 
+                                    pivot_wider(names_from = LeafPhenology_simplified, 
+                                                values_from = Cumulative_cover_LP, 
+                                                values_fill = 0), 
+                                  by="PlotObservationID") %>% 
+  #Attach cumulative cover of tree layer
+  left_join(PlotLevel_gfCovers %>% 
+              dplyr::filter(Layer=="tree") %>% 
+              dplyr::select(PlotObservationID, Layer_cover, vegtype)) %>% 
+  mutate_at(.vars = vars(broadleaved:LP_unknown), .funs=~./Layer_cover)
+```
+
+Show output
+
+```{r, echo=F}
+knitr::kable(PlotLevel_leaf_Cover %>%
+               filter(PlotObservationID %in% sample(PlotLevel_leaf_Cover$PlotObservationID, 10)),
+             caption="Proportion of relative cover of each plot for different classes of leaf type and leaf phenology [10 randomly selected plots shown]") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                  full_width = F, position = "center")
+```
+Tentative classification in forest types
+```{r}
+PlotLevel_leaf_Cover <- PlotLevel_leaf_Cover %>% 
+  # select only forest plots 
+  filter(vegtype=="Forest") %>% 
+  mutate(ForestType=NA) %>% 
+  mutate(ForestType=replace(ForestType, 
+                            list=c(broadleaved>0.7 & deciduous >0.7), 
+                            values="DBF")) %>%
+  mutate(ForestType=replace(ForestType, 
+                            list=c(broadleaved>0.7 & evergreen >0.7), 
+                            values="EBF")) %>% 
+  mutate(ForestType=replace(ForestType, 
+                            list=c(needleleaved>0.7 & evergreen >0.7), 
+                            values="ENF")) %>% 
+  mutate(ForestType=replace(ForestType, 
+                            list=c(needleleaved>0.7 & deciduous >0.7), 
+                            values="DNF")) %>% 
+# NOTE!! I defined mixed forests if a mixture of deciduous and evergreen
+# not if a mixture of broad and needle-leaved
+  mutate(ForestType=replace(ForestType, 
+                            list=c(is.na(ForestType) & 
+                                   LT_unknown < 0.3 &
+                                   LP_unknown < 0.3 &
+                                   deciduous > 0.2 & 
+                                   evergreen > 0.2), 
+                            values="MF")) 
+
+PlotLevel_leaf_Cover %>% 
+  count(ForestType)
+```
+Show example of unclassified plots
+```{r, echo=F}
+knitr::kable(PlotLevel_leaf_Cover %>% 
+               filter(is.na(ForestType)) %>% 
+               sample_n(10),
+             caption="Proportion of relative cover of each plot for different classes of leaf type and leaf phenology in 10 randomly selected unclassified plots") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                  full_width = F, position = "center")
+```
+
+If detailed information on the forest type is available from the EUNIS classification in sPlotOpen, overimpose that classification
+
+```{r}
+PlotLevel_leaf_Cover <- PlotLevel_leaf_Cover %>% 
+  left_join(header.oa %>% 
+              dplyr::select(PlotObservationID, FT),
+            by="PlotObservationID") %>% 
+  mutate(ForestType=coalesce(FT, ForestType)) %>% 
+  dplyr::select(-FT) 
+
+#show results
+PlotLevel_leaf_Cover %>% 
+  count(ForestType)
+```
+
+
+
+# Calculate CWMs 
+Merge species data table with traits
+```{r}
+CWM_CWV.oa0 <- DT2.oa.gf %>%
+  as_tibble() %>%
+  dplyr::select(PlotObservationID, Species, Relative_cover, gf:LeafPhenology_simplified) %>%
+  left_join(TRY %>%
+              dplyr::rename(Species=StandSpeciesName) %>%
+              dplyr::select(Species, LeafArea.mean:Wood.vessel.length.mean), 
+            by="Species") %>% 
+  rename_at(.vars=vars(ends_with(".mean")), 
+            .funs=~gsub(pattern=".mean", replacement="", x=.)) 
+```
+
+
+## Calculate CWM and CWVs at plot level
+Calculate the completeness of trait information in each plot, both based on relative cover and number of species. To be considered, a species needs to have both growth form and trait info.
+```{r}
+# number of species with trait information.
+CWM_CWV.oa0 %>% 
+  distinct(Species, .keep_all = T) %>% 
+  filter(!is.na(SLA)) %>% 
+  nrow()
+
+# Calculate cumulative coverage of species having both growth form and trait info in each plot
+CWM_CWV.oa2 <- CWM_CWV.oa0 %>%
+  mutate_at(.vars = vars(LeafArea, gf), 
+            .funs = list(~if_else(is.na(.),0,1))) %>%
+  group_by(PlotObservationID) %>%
+  summarize(TraitCoverage_cover=sum(LeafArea*gf*Relative_cover, na.rm=T),
+            Species_richness=n(),
+            TraitCoverage_pa=mean((LeafArea*gf)>0), 
+            .groups = 'drop')
+```
+
+Calculate CWM and CWV for each trait in each plot
+```{r, cache=T}
+CWM_CWV.oa1 <- CWM_CWV.oa0 %>%
+  group_by(PlotObservationID) %>%
+  summarize_at(.vars= vars(LeafArea:Wood.vessel.length),
+               .funs = list(CWM=~weighted.mean(., Relative_cover, na.rm=T), 
+                            CWV=~variance2.fun(., Relative_cover)))
+```
+
+Assemble output
+```{r}  
+CWM_CWV_all <- PlotLevel_gfCovers %>% 
+  distinct(PlotObservationID, gf_coverage, vegtype) %>% 
+  mutate(Layer="all") %>% 
+  left_join(PlotLevel_leaf_Cover %>% 
+              dplyr::select(PlotObservationID, ForestType), 
+            by="PlotObservationID") %>% 
+  relocate(vegtype, ForestType, .after=last_col()) %>%  
+  left_join(CWM_CWV.oa2, by="PlotObservationID") %>% 
+  left_join(CWM_CWV.oa1, by="PlotObservationID") %>% 
+  filter(!is.na(TraitCoverage_cover)) ##TEMP
+
+#show
+CWM_CWV_all[1:10,1:9] #first 9 columns
+```
+
+
+## Calculate CWM for each vegetation layer in each plot
+Calculate completeness of trait information for each layer in each plot, both based on relative cover and number of species. To be considered, a species needs to have both growth form and trait info.
+```{r}
+# Calculate cumulative coverage of species having both growth form and trait info in each layer of each plot
+CWM_CWV.oa2.layer <- CWM_CWV.oa0 %>%
+  mutate(Layer=gf) %>% 
+  mutate_at(.vars = vars(LeafArea, gf), 
+            .funs = list(~if_else(is.na(.),0,1))) %>%
+  group_by(PlotObservationID, Layer) %>%
+  summarize(TraitCoverage_cover=sum(LeafArea*
+                                      gf*
+                                      Relative_cover, 
+                                    na.rm=T),
+            Species_richness=n(),
+            TraitCoverage_pa=mean((LeafArea*gf)>0), 
+            .groups = 'drop')
+```
+
+Calculate CWM and CWV for each trait in each vegetation layer of each plot
+```{r, cache=T}
+CWM_CWV.oa1.layer <- CWM_CWV.oa0 %>%
+  rename(Layer=gf) %>% 
+  group_by(PlotObservationID, Layer) %>%
+  summarize_at(.vars= vars(LeafArea:Wood.vessel.length),
+               .funs = list(CWM=~weighted.mean(., Relative_cover, na.rm=T), 
+                            CWV=~variance2.fun(., Relative_cover)))
+
+```
+
+Assemble output
+```{r}  
+CWM_CWV_layer <- PlotLevel_gfCovers %>% 
+  left_join(PlotLevel_leaf_Cover %>% 
+              dplyr::select(PlotObservationID, ForestType), 
+            by="PlotObservationID") %>% 
+  left_join(CWM_CWV.oa2.layer, by=c("PlotObservationID",  "Layer")) %>% 
+  left_join(CWM_CWV.oa1.layer, by=c("PlotObservationID",  "Layer")) %>% 
+  filter(!is.na(TraitCoverage_cover)) #exclude empty layers
+
+#show
+CWM_CWV_layer[1:10,1:9] #first 9 columns
+```
+## Calculate CWM and CWVs for each combo of leaf type and leaf phenology in each plot (trees only)
+For tree species only, calculate CWM and CWV for each combo of leaf type and leaf phenology in each plot
+
+```{r}
+# Calculate cumulative coverage of species having leaf phenology, leaf type and trait info in each  plot
+CWM_CWV.oa2.leaf <- CWM_CWV.oa0 %>%
+  filter(gf=="tree") %>% 
+  mutate(Layer=gf) %>% 
+  #  #reclassify tree species
+  mutate(LT=fct_recode(LeafType_simplified,
+                         B="broadleaved", 
+                         N="needleleaved", 
+                         LL="leafless")) %>% 
+  mutate(LP=fct_recode(LeafPhenology_simplified,
+                         D="deciduous", 
+                         E="evergreen")) %>% 
+  mutate_at(.vars = vars(LeafArea), 
+            .funs = list(~if_else(is.na(.),0,1))) %>%
+  group_by(PlotObservationID, LT, LP) %>%
+  summarize(TraitCoverage_cover=sum(LeafArea* Relative_cover, 
+                                    na.rm=T),
+            Species_richness=n(),
+            TraitCoverage_pa=mean((LeafArea)>0), 
+            .groups = 'drop')
+```
+
+Calculate CWM and CWV for each trait for each leaf type\\phenology combo for trees in each plot
+```{r, cache=T}
+CWM_CWV.oa1.leaf <- CWM_CWV.oa0 %>%
+  filter(gf=="tree") %>% 
+  #  #reclassify tree species
+  mutate(LT=fct_recode(LeafType_simplified,
+                         B="broadleaved", 
+                         N="needleleaved", 
+                         LL="leafless")) %>% 
+  mutate(LP=fct_recode(LeafPhenology_simplified,
+                         D="deciduous", 
+                         E="evergreen")) %>% 
+  group_by(PlotObservationID, LT, LP) %>%
+  summarize_at(.vars= vars(LeafArea:Wood.vessel.length),
+               .funs = list(CWM=~weighted.mean(., Relative_cover, na.rm=T), 
+                            CWV=~variance2.fun(., Relative_cover)))
+
+```
+
+Assemble output
+```{r}  
+CWM_CWV_leaf <- PlotLevel_gfCovers %>% 
+  filter(Layer=="tree") %>% 
+  left_join(PlotLevel_leaf_Cover %>% 
+            dplyr::select(PlotObservationID, ForestType), 
+          by="PlotObservationID") %>% 
+  left_join(CWM_CWV.oa2.leaf, by=c("PlotObservationID")) %>% 
+  left_join(CWM_CWV.oa1.leaf, by=c("PlotObservationID", "LT", "LP")) %>% 
+  filter(!is.na(TraitCoverage_cover)) #exclude empty layers
+
+#show
+CWM_CWV_layer[1:10,1:9] #first 9 columns
+```
+# Bind plot-level, layer and leaf-based CWM\\CWVs
+```{r}
+CWM_CWV <- CWM_CWV_layer %>% 
+  bind_rows(CWM_CWV_all %>% 
+              mutate(Layer_cover=gf_coverage)) %>% 
+  mutate(LT="all", LP="all") %>% 
+  relocate(LT:LP, .after=ForestType) %>% 
+  bind_rows(CWM_CWV_leaf) %>% 
+  arrange(PlotObservationID, Layer, LT, LP)
+```
+
+Number of plots without a single species with growth form and trait information
+```{r}  
+CWM_CWV %>% 
+  filter(TraitCoverage_cover==0 | gf_coverage==0) %>% 
+  nrow()
+```
+
+Rename fields to follow convention
+```{r}
+CWM_CWV <- CWM_CWV %>% 
+  rename_all(.funs=~gsub('\\.', '_', x = .))
+```
+
+
+# Show Output
+
+```{r, echo=F}
+knitr::kable(CWM_CWV %>%
+               filter(PlotObservationID %in% sample(header.oa$PlotObservationID, 10)),
+             caption="Example of CWM_CWV [10 randomly selected plots shown]") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                  full_width = F, position = "center")
+```
+
+
+Legend of key column names:  
+- gf_coverage: cumulative (plot level) relative cover of species having growth form information  
+- Layer: vegetation layer (all, trees, shrubs, herbs)  
+- Layer_cover: cumulative relative cover in vegetation layer  
+- vegtype: vegetation type of plot. Only plots with more than 70% of relative cover with growth form information are classified.   Forest: the cumulative relative cover of tree species is > 10%; Shrubland: the cumulative relative cover of tree species <10% and the cumulative relative cover of shrubs >10%.  
+- LT: Leaf Type (B=Broadleaf, N=Needleleaf, LL=Leafless)  
+- LP: Leaf Phenology (E=Evergreen, D=Deciduous)  
+- TraitCoverage_cover: The cumulative relative cover of all those species having both growth form and trait information in a plot.  
+- Species_richness: Number of species occurring in each layer of each plot, notwithstanding the availability of trait or growth form information  
+- TraitCoverage_pa: Proportion of Species_richness in a plot for which both growth form and trait information is available.  
+
+
+
+
+# Save Ouput
+```{r}
+path <- "CWM_CWV_layer"
+save(header.oa, DT2.oa.gf, CWM_CWV, file = file.path(path, "sPlotOpen_oa_layer.RData"))
+write_delim(CWM_CWV, file = file.path(path, "sPlotOpen_CWM_CWV_layer.txt"), delim="\t")
+```
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+
